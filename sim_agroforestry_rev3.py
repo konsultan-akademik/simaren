@@ -1,7 +1,7 @@
 import json
 import os
 import secrets
-import sqlite3
+import sqlalchemy
 from datetime import datetime
 import pandas as pd
 import streamlit as st
@@ -125,118 +125,59 @@ DEFAULT_DATA = {
     ]
 }
 
+# Mengambil connection string dari st.secrets
+def get_db_engine():
+    db_url = st.secrets["postgres"]["url"]
+    return sqlalchemy.create_engine(db_url)
+
 def _connect_db():
-    connection = sqlite3.connect(DB_FILE)
-    for table_name in FEATURE_TABLES.values():
-        connection.execute(f"""
-            CREATE TABLE IF NOT EXISTS {table_name} (
-            position INTEGER NOT NULL,
+    engine = get_db_engine()
+    with engine.begin() as conn:
+        for table_name in FEATURE_TABLES.values():
+            conn.execute(sqlalchemy.text(f"""
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    position INT PRIMARY KEY,
+                    payload TEXT NOT NULL
+                )
+            """))
+        conn.execute(sqlalchemy.text("""
+            CREATE TABLE IF NOT EXISTS app_records (
+                collection TEXT NOT NULL,
+                position INT NOT NULL,
                 payload TEXT NOT NULL,
-                PRIMARY KEY (position)
+                PRIMARY KEY (collection, position)
             )
-        """)
-    # Retain the generic table for backward compatibility and future collections.
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS app_records (
-            collection TEXT NOT NULL,
-            position INTEGER NOT NULL,
-            payload TEXT NOT NULL,
-            PRIMARY KEY (collection, position)
-        )
-    """)
-    return connection
+        """))
 
-
-def _write_db_data(connection, data):
+def _write_db_data(data):
+    engine = get_db_engine()
     feature_collections = set(FEATURE_TABLES)
-    for collection, table_name in FEATURE_TABLES.items():
-        records = data.get(collection, [])
-        if not isinstance(records, list):
-            records = [records]
-        connection.execute(f"DELETE FROM {table_name}")
-        connection.executemany(
-            f"INSERT INTO {table_name}(position, payload) VALUES (?, ?)",
-            [
-                (position, json.dumps(record, ensure_ascii=False))
-                for position, record in enumerate(records)
-            ]
-        )
-
-    # Unknown collections remain available through the legacy-compatible table.
-    connection.execute("DELETE FROM app_records")
-    for collection, records in data.items():
-        if collection in feature_collections:
-            continue
-        if not isinstance(records, list):
-            records = [records]
-        connection.executemany(
-            "INSERT INTO app_records(collection, position, payload) VALUES (?, ?, ?)",
-            [
-                (str(collection), position, json.dumps(record, ensure_ascii=False))
-                for position, record in enumerate(records)
-            ]
-        )
-
-
-def _read_db_data(connection):
-    data = {}
-    for collection, table_name in FEATURE_TABLES.items():
-        rows = connection.execute(
-            f"SELECT payload FROM {table_name} ORDER BY position"
-        ).fetchall()
-        if rows:
-            data[collection] = [json.loads(payload) for (payload,) in rows]
-
-    # Import collections from the former shared table when no feature table has
-    # been populated yet. The next normal save writes them into their own tables.
-    rows = connection.execute(
-        "SELECT collection, payload FROM app_records ORDER BY collection, position"
-    ).fetchall()
-    for collection, payload in rows:
-        if collection not in data:
-            data.setdefault(collection, []).append(json.loads(payload))
-    return data
-
-
-def load_data():
-    if "app_data" not in st.session_state:
-        try:
-            with _connect_db() as connection:
-                data = _read_db_data(connection)
-                if not data:
-                    # Import existing JSON data once when initializing the database.
-                    if os.path.exists(DATA_FILE):
-                        try:
-                            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                                data = json.load(f)
-                        except (OSError, json.JSONDecodeError):
-                            data = {}
-                    if not data:
-                        data = json.loads(json.dumps(DEFAULT_DATA))
-                    _write_db_data(connection, data)
-                st.session_state["app_data"] = data
-        except (sqlite3.Error, json.JSONDecodeError) as e:
-            st.error(f"Gagal membaca database: {e}")
-            st.session_state["app_data"] = json.loads(json.dumps(DEFAULT_DATA))
-
-    # Migration helper for team data credentials
-    data = st.session_state["app_data"]
-    for member in data.get("team", []):
-        if "username" not in member:
-            member["username"] = member.get("name", "").lower().replace(" ", ".").replace(",", "")
-        if "password" not in member:
-            member["password"] = "password123"
+    
+    with engine.begin() as conn:
+        for collection, table_name in FEATURE_TABLES.items():
+            records = data.get(collection, [])
+            if not isinstance(records, list):
+                records = [records]
             
-    return st.session_state["app_data"]
+            conn.execute(sqlalchemy.text(f"DELETE FROM {table_name}"))
+            for position, record in enumerate(records):
+                conn.execute(
+                    sqlalchemy.text(f"INSERT INTO {table_name} (position, payload) VALUES (:pos, :payload)"),
+                    {"pos": position, "payload": json.dumps(record, ensure_ascii=False)}
+                )
 
-def save_data():
-    if "app_data" in st.session_state:
-        try:
-            with _connect_db() as connection:
-                _write_db_data(connection, st.session_state["app_data"])
-        except (sqlite3.Error, TypeError, ValueError) as e:
-            st.error(f"Gagal menyimpan data ke database: {e}")
-
+def _read_db_data():
+    engine = get_db_engine()
+    data = {}
+    
+    with engine.connect() as conn:
+        for collection, table_name in FEATURE_TABLES.items():
+            result = conn.execute(sqlalchemy.text(f"SELECT payload FROM {table_name} ORDER BY position"))
+            rows = result.fetchall()
+            if rows:
+                data[collection] = [json.loads(row[0]) for row in rows]
+                
+    return data
 def add_log(text):
     now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
     data = load_data()
