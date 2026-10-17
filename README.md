@@ -1,4 +1,1 @@
-sqlite
-pandas
-streamlit
-matplotlib
+
