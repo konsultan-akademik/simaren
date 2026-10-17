@@ -1,0 +1,4 @@
+sqlite
+pandas
+streamlit
+matplotlib
